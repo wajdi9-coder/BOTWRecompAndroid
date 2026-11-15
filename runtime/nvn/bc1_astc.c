@@ -14,9 +14,25 @@
 #include <string.h>
 
 typedef struct { uint64_t w[2]; } Bits;
-static void put(Bits *b, int pos, int n, uint32_t v) {  // bits [pos, pos + n), LSB first
-    for (int i = 0; i < n; i++, pos++)
-        if (v >> i & 1) b->w[pos >> 6] |= 1ull << (pos & 63);
+// bits [pos, pos + n) of the block, LSB first (n <= 32, pos + n <= 128): a shift and an OR on the word (or two) they
+// are in - this was a loop over the bits, and the block's 100 or so bits made it most of the time of a block
+static inline void put(Bits *b, int pos, int n, uint32_t v) {
+    uint64_t x = (uint64_t)v & ((1ull << n) - 1);
+    int lo = pos & 63, wi = pos >> 6;
+    b->w[wi] |= x << lo;
+    if (lo + n > 64) b->w[wi + 1] |= x >> (64 - lo);
+}
+
+// x with its 64 bits in reverse order (a single rbit on arm64)
+static inline uint64_t rev64(uint64_t x) {
+#if defined(__clang__)
+    return __builtin_bitreverse64(x);
+#else
+    x = ((x >> 1) & 0x5555555555555555ull) | ((x & 0x5555555555555555ull) << 1);
+    x = ((x >> 2) & 0x3333333333333333ull) | ((x & 0x3333333333333333ull) << 2);
+    x = ((x >> 4) & 0x0F0F0F0F0F0F0F0Full) | ((x & 0x0F0F0F0F0F0F0F0Full) << 4);
+    return __builtin_bswap64(x);
+#endif
 }
 
 // The 8-bit code of five trits: the smallest T that the spec's decoding maps to them (C.2.12), so that a short last
@@ -45,23 +61,22 @@ static pthread_once_t g_trits_once = PTHREAD_ONCE_INIT;
 
 // The weights (n values of 2 bits, or trits when trits) as the spec stores them: the integer sequence, its bits
 // reversed from bit 127 down. Returns its length in bits.
-static int put_weights(Bits *b, const uint8_t *w, int n, int trits) {
-    Bits s = {{0, 0}};
+// (the weights are at most 52 bits: one word, which put_weights reverses into the block's upper word)
+static int trit_stream(const uint8_t *w, int n, uint64_t *out) {
+    uint64_t s = 0;
     int len = 0;
-    if (!trits) {
-        for (int i = 0; i < n; i++) put(&s, len, 2, w[i]), len += 2;
-    } else {
-        for (int g = 0; g < n; g += 5) {
-            int k = n - g < 5 ? n - g : 5, idx = 0;
-            for (int j = k - 1; j >= 0; j--) idx = idx * 3 + w[g + j];
-            int bits = (8 * k + 4) / 5;  // (8 bits for 5 trits; a short group only the bits it needs)
-            put(&s, len, bits, g_trit_code[idx]), len += bits;
-        }
+    for (int g = 0; g < n; g += 5) {
+        int k = n - g < 5 ? n - g : 5, idx = 0;
+        for (int j = k - 1; j >= 0; j--) idx = idx * 3 + w[g + j];
+        int bits = (8 * k + 4) / 5;  // (8 bits for 5 trits; a short group only the bits it needs)
+        s |= (uint64_t)g_trit_code[idx] << len;
+        len += bits;
     }
-    for (int i = 0; i < len; i++)
-        if (s.w[i >> 6] >> (i & 63) & 1) b->w[(127 - i) >> 6] |= 1ull << ((127 - i) & 63);
+    *out = s;
     return len;
 }
+// Bit i of the stream s goes to bit 127 - i of the block: the stream reversed, in the block's upper word
+static void put_stream(Bits *b, uint64_t s) { b->w[1] |= rev64(s); }
 
 static int unq7(int q) { return q << 1 | q >> 6; }  // (a 7-bit endpoint back to 8 bits: bit replication)
 static int q7(int e) {  // (the nearest 7-bit endpoint)
@@ -81,26 +96,35 @@ static void one(const uint8_t *in, uint8_t *out) {
     int e0[3], e1[3];
     expand565(c0, e0);
     expand565(c1, e1);
-    bool four = c0 > c1, clear = false;
-    if (!four)
-        for (int i = 0; i < 16; i++) clear |= (idx >> 2 * i & 3) == 3;
+    bool four = c0 > c1;
+    // (3 colours: a texel with index 3 is transparent - both bits of its two set)
+    bool clear = !four && ((idx & (idx >> 1)) & 0x55555555u) != 0;
     Bits b = {{0, 0}};
     uint8_t w[32];
     if (!clear) {
         // Index -> weight: 4 colours 0, 3, 1, 2 (of 0..3); 3 colours 0, 2, 1 (of 0..2). The second endpoint's sum must
         // be at least the first's (else the decoder blue-contracts): swapped with the weights mirrored if not.
-        static const uint8_t map4[4] = {0, 3, 1, 2}, map3[4] = {0, 2, 1, 0};
-        int top = four ? 3 : 2;
         bool swap = e1[0] + e1[1] + e1[2] < e0[0] + e0[1] + e0[2];
-        for (int i = 0; i < 16; i++) {
-            int q = (four ? map4 : map3)[idx >> 2 * i & 3];
-            w[i] = (uint8_t)(swap ? top - q : q);
-        }
         put(&b, 0, 11, four ? 0x42 : 0x51);  // (4x4 weights, one plane; 4 levels / 3 levels)
         put(&b, 13, 4, 8);                   // (one partition: bits 11-12 zero; CEM 8)
         const int *a = swap ? e1 : e0, *z = swap ? e0 : e1;
         for (int c = 0; c < 3; c++) put(&b, 17 + 16 * c, 8, (uint32_t)a[c]), put(&b, 25 + 16 * c, 8, (uint32_t)z[c]);
-        put_weights(&b, w, 16, !four);
+        if (four) {
+            // 0, 3, 1, 2 for the indices 0..3 is, per 2-bit field, (b0 << 1) | (b0 ^ b1); mirrored (3 - q) is the
+            // field's bits inverted. The weights in the order the spec stores them are this word, 2 bits a texel.
+            uint32_t lo = idx & 0x55555555u, hi = (idx >> 1) & 0x55555555u;
+            uint32_t ww = lo << 1 | (lo ^ hi);
+            put_stream(&b, (uint64_t)(swap ? ~ww : ww));
+        } else {
+            static const uint8_t map3[4] = {0, 2, 1, 0};
+            for (int i = 0; i < 16; i++) {
+                int q = map3[idx >> 2 * i & 3];
+                w[i] = (uint8_t)(swap ? 2 - q : q);
+            }
+            uint64_t s;
+            trit_stream(w, 16, &s);
+            put_stream(&b, s);
+        }
     } else {
         // Dual plane: RGB on plane 1 (a transparent texel on the darker endpoint), alpha on plane 2. 52 weight bits
         // leave 57 for 8 endpoint values: 7 bits each (bit replication back to 8).
@@ -122,7 +146,9 @@ static void one(const uint8_t *in, uint8_t *out) {
         const int *a = swap ? q1 : q0, *z = swap ? q0 : q1;
         for (int c = 0; c < 3; c++) put(&b, 17 + 14 * c, 7, (uint32_t)a[c]), put(&b, 24 + 14 * c, 7, (uint32_t)z[c]);
         put(&b, 59, 7, 0), put(&b, 66, 7, 127);  // (alpha 0 .. 255)
-        int len = put_weights(&b, w, 32, 1);
+        uint64_t s;
+        int len = trit_stream(w, 32, &s);
+        put_stream(&b, s);
         put(&b, 128 - len - 2, 2, 3);  // (the second plane's component: alpha)
     }
     memcpy(out, b.w, 16);
