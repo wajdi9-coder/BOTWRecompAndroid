@@ -18,11 +18,13 @@ android {
     ndkVersion = "30.0.16248370"
 
     defaultConfig {
-        applicationId = "com.botwrecomp.android"
+        // -PbotwIdSuffix=.fps installs next to the original app (another signing key can't update it, and uninstalling it
+        // would delete its game files); empty (default): the original id
+        applicationId = "com.botwrecomp.android" + (providers.gradleProperty("botwIdSuffix").getOrElse(""))
         minSdk = 30
         targetSdk = 36
-        versionCode = 41
-        versionName = "0.4.2-beta"
+        versionCode = 40
+        versionName = "0.4.1-beta"
         ndk {
             abiFilters += "arm64-v8a"
         }
