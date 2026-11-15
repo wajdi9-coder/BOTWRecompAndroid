@@ -31,10 +31,16 @@
 
 #if defined(__aarch64__)
 #define UC_PC(uc) ((uint64_t)(uc)->uc_mcontext.pc)
+#define UC_X8(uc) ((uint64_t)(uc)->uc_mcontext.regs[8])
+#define UC_LR(uc) ((uint64_t)(uc)->uc_mcontext.regs[30])
 #elif defined(__x86_64__)
 #define UC_PC(uc) ((uint64_t)(uc)->uc_mcontext.gregs[REG_RIP])
 #else
 #define UC_PC(uc) ((uint64_t)0)
+#endif
+#ifndef UC_X8
+#define UC_X8(uc) ((uint64_t)0)
+#define UC_LR(uc) ((uint64_t)0)
 #endif
 
 #define MAXS 300000
@@ -43,11 +49,14 @@
 #define TOP_THREADS 4
 #define TOP_ROWS 28
 
-static uint64_t s_pc[MAXS];
+static uint64_t s_pc[MAXS], s_lr[MAXS];
 static uint32_t s_tid[MAXS];
+static uint32_t s_sys[MAXS];  // 0, or 0x10000 | the syscall number when the thread is just past an svc (in a system call)
 static _Atomic uint32_t s_n;
 static volatile int s_on;
 static double s_len = 15;
+extern uint64_t plat_wt_faults(uint64_t *ahead_pages);  // (runtime/platform/android.c: page write-tracking faults so far)
+static uint64_t s_f0, s_a0, s_f1, s_a1;
 
 typedef struct {
     int tid;
@@ -64,7 +73,15 @@ static void on_sig(int sig, siginfo_t *si, void *ucv) {
     if (!s_on) return;
     uint32_t i = atomic_fetch_add_explicit(&s_n, 1, memory_order_relaxed);
     if (i >= MAXS) return;
-    s_pc[i] = UC_PC((ucontext_t *)ucv);
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint64_t pc = UC_PC(uc);
+    s_pc[i] = pc;
+    s_lr[i] = UC_LR(uc);
+    s_sys[i] = 0;
+#if defined(__aarch64__)
+    // (the instruction before pc is an svc #0: the thread is in, or just back from, that system call; x8 is its number)
+    if ((pc & 0xfff) >= 4 && *(const uint32_t *)(uintptr_t)(pc - 4) == 0xd4000001u) s_sys[i] = 0x10000u | (uint32_t)UC_X8(uc);
+#endif
     s_tid[i] = (uint32_t)syscall(SYS_gettid);
 }
 
@@ -162,6 +179,36 @@ static uint64_t key_of(uint64_t pc, char *name, size_t nn, char *mod, size_t mn)
     return ok ? (uint64_t)(uintptr_t)di.dli_fbase + (off & ~0xffull) : pc;
 }
 
+static const char *sys_name(uint32_t nr) {
+    switch (nr) {  // (arm64)
+    case 29: return "ioctl";
+    case 56: return "openat";
+    case 57: return "close";
+    case 63: return "read";
+    case 64: return "write";
+    case 73: return "ppoll";
+    case 93: return "exit";
+    case 98: return "futex";
+    case 101: return "nanosleep";
+    case 113: return "clock_gettime";
+    case 115: return "clock_nanosleep";
+    case 124: return "sched_yield";
+    case 131: return "tgkill";
+    case 134: return "rt_sigaction";
+    case 135: return "rt_sigprocmask";
+    case 139: return "rt_sigreturn";
+    case 165: return "getrusage";
+    case 178: return "gettid";
+    case 215: return "munmap";
+    case 222: return "mmap";
+    case 226: return "mprotect";
+    case 233: return "madvise";
+    case 261: return "prlimit64";
+    case 283: return "membarrier";
+    default: return "?";
+    }
+}
+
 typedef struct {
     uint64_t key, pc;
     uint32_t n;
@@ -225,6 +272,53 @@ static void report_thread(const Th *t, uint32_t total) {
         LOG("[sampleprof]   %5.1f%% %6u  %s\n", 100.0 * rows[i].n / cnt, rows[i].n, name);
     }
     free(rows);
+
+    // the samples that were in a system call: which one, and who called it
+    uint32_t nsys = 0;
+    for (uint32_t i = 0; i < total; i++) nsys += s_tid[i] == (uint32_t)t->tid && s_sys[i];
+    if (!nsys) return;
+    LOG("[sampleprof]   in system calls: %.1f%% of the samples\n", 100.0 * nsys / cnt);
+    uint32_t nrs[16], ns[16];
+    int nn = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        if (s_tid[i] != (uint32_t)t->tid || !s_sys[i]) continue;
+        uint32_t nr = s_sys[i] & 0xffff;
+        int k = 0;
+        while (k < nn && nrs[k] != nr) k++;
+        if (k == nn && nn < 16) nrs[nn] = nr, ns[nn++] = 0;
+        if (k < nn) ns[k]++;
+    }
+    for (int a = 0; a < nn; a++)
+        for (int b = a + 1; b < nn; b++)
+            if (ns[b] > ns[a]) {
+                uint32_t x = ns[a]; ns[a] = ns[b]; ns[b] = x;
+                x = nrs[a]; nrs[a] = nrs[b]; nrs[b] = x;
+            }
+    for (int a = 0; a < nn && a < 5; a++) {
+        LOG("[sampleprof]     syscall %u %-16s %5.1f%% of the samples\n", nrs[a], sys_name(nrs[a]), 100.0 * ns[a] / cnt);
+        // its callers: the link register's function (the code that called the libc wrapper)
+        Row *cr = malloc(ns[a] * sizeof *cr);
+        if (!cr) continue;
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < total; i++) {
+            if (s_tid[i] != (uint32_t)t->tid || (s_sys[i] & 0xffff) != nrs[a] || !s_sys[i]) continue;
+            cr[m].key = key_of(s_lr[i], name, sizeof name, mod, sizeof mod);
+            cr[m].pc = s_lr[i];
+            cr[m++].n = 1;
+        }
+        qsort(cr, m, sizeof *cr, cmp_key);
+        uint32_t w2 = 0;
+        for (uint32_t i = 0; i < m; i++) {
+            if (w2 && cr[w2 - 1].key == cr[i].key) cr[w2 - 1].n++;
+            else cr[w2++] = cr[i];
+        }
+        qsort(cr, w2, sizeof *cr, cmp_n);
+        for (uint32_t i = 0; i < w2 && i < 4; i++) {
+            key_of(cr[i].pc, name, sizeof name, mod, sizeof mod);
+            LOG("[sampleprof]         from %5.1f%% %5u  %s\n", 100.0 * cr[i].n / ns[a], cr[i].n, name);
+        }
+        free(cr);
+    }
 }
 
 static int cmp_th(const void *a, const void *b) {
@@ -238,6 +332,8 @@ static void report(void) {
     build_fn_map();
     LOG("[sampleprof] %u samples in %.0f s (a thread is sampled only while running; \"run\" = its share of the sampler's looks)\n",
         total, s_len);
+    LOG("[sampleprof] page write-tracking faults: %llu in %.0f s (%.0f a second); pages opened ahead: %llu\n",
+        (unsigned long long)(s_f1 - s_f0), s_len, (double)(s_f1 - s_f0) / s_len, (unsigned long long)(s_a1 - s_a0));
     qsort(s_th, (size_t)s_nth, sizeof s_th[0], cmp_th);
     for (int i = 0; i < s_nth && i < 12; i++) {
         const Th *t = &s_th[i];
@@ -271,6 +367,7 @@ static void *sampler(void *arg) {
     int self = (int)syscall(SYS_gettid);
     struct timespec t0, now, nap = {0, 5 * 1000 * 1000};
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    s_f0 = plat_wt_faults(&s_a0);
     s_on = 1;
     LOG("[sampleprof] sampling for %.0f s\n", s_len);
     for (;;) {
@@ -296,6 +393,7 @@ static void *sampler(void *arg) {
         }
         nanosleep(&nap, NULL);
     }
+    s_f1 = plat_wt_faults(&s_a1);
     s_on = 0;
     usleep(60 * 1000);  // (signals still on their way)
     report();
