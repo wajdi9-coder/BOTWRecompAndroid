@@ -15,5 +15,7 @@ foreach(f ${_gamelib_srcs})
     # code an id the installed app rejected - the launcher took the game for missing)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${R}/${f})
 endforeach()
-string(SHA256 _id "${_id_text}${GAMELIB_FLAGS} --simd asm --dyn-base")
+# GAMELIB_CPU (the app's Gradle property botwGameCpu; empty: the same id as without it): the CPU the game code is
+# compiled for on the phone (runtime/gamebuild.c), so an app built for one rebuilds the code another left
+string(SHA256 _id "${_id_text}${GAMELIB_FLAGS} --simd asm --dyn-base${GAMELIB_CPU}")
 string(SUBSTRING ${_id} 0 16 GAMELIB_ID)
