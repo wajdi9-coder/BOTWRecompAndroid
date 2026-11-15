@@ -31,6 +31,9 @@ android {
         externalNativeBuild {
             cmake {
                 arguments += "-DBOTW_GEN_DIR=${gen.get().asFile.resolve("inc").absolutePath.replace('\\', '/')}"
+                // -PbotwGameCpu=cortex_a715: the game code compiled on the phone for that CPU (runtime/gamebuild.c)
+                val gameCpu = providers.gradleProperty("botwGameCpu").getOrElse("")
+                if (gameCpu.isNotBlank()) arguments += "-DGAMELIB_CPU=${gameCpu.trim()}"
             }
         }
     }
