@@ -57,7 +57,11 @@ add_library(main SHARED ${RT_SRC} ${R}/runtime/platform/android.c ${VK_SRC} ${UI
 # the UI sources are plain C++ apart from __APPLE__ blocks (compiled as C++ on Android)
 set_source_files_properties(${UI_SRC} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-xc++")
 set_source_files_properties(${R}/runtime/gamelib.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
-set_source_files_properties(${R}/runtime/gamebuild.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
+set(_gamebuild_defs "GAMELIB_ID=\"${GAMELIB_ID}\"")
+if(GAMELIB_CPU)
+    list(APPEND _gamebuild_defs "GAMELIB_CPU=\"${GAMELIB_CPU}\"")
+endif()
+set_source_files_properties(${R}/runtime/gamebuild.c PROPERTIES COMPILE_DEFINITIONS "${_gamebuild_defs}")
 # the benchmark's report names the commit this build came from (asked on every build, benchmark_commit.cmake)
 add_custom_target(benchmark_commit BYPRODUCTS ${CMAKE_BINARY_DIR}/benchmark/benchmark_commit.h
     COMMAND ${CMAKE_COMMAND} -DR=${R} -DOUT=${CMAKE_BINARY_DIR}/benchmark/benchmark_commit.h -P ${CMAKE_CURRENT_LIST_DIR}/benchmark_commit.cmake VERBATIM)
