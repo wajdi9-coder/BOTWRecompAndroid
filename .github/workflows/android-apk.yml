@@ -10,6 +10,10 @@ on:
         description: "App id suffix. '.fps' installs next to the original app; empty replaces it (needs the same signing key)"
         default: ".fps"
         required: false
+      game_cpu:
+        description: "CPU the game code is compiled for on the phone (zig -mcpu), e.g. cortex_a715. Empty: the baseline"
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -78,7 +82,7 @@ jobs:
         working-directory: android/botwrecompandroid
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon "-PbotwIdSuffix=${{ inputs.id_suffix }}"
+          ./gradlew assembleRelease --no-daemon "-PbotwIdSuffix=${{ inputs.id_suffix }}" "-PbotwGameCpu=${{ inputs.game_cpu }}"
 
       - uses: actions/upload-artifact@v4
         with:
