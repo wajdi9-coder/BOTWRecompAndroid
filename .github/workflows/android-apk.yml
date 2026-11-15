@@ -1,1 +1,77 @@
+# Builds the BOTWRecompAndroid APK on GitHub (Ubuntu): the dependencies (SDL3, shaderc, FFmpeg), the game code's builder
+# that the app runs on the phone (Python, zig, unicorn, capstone), then Gradle.
+# Run it from Actions > Android APK > Run workflow. The APK comes out under "Artifacts".
+name: Android APK
 
+on:
+  workflow_dispatch:
+    inputs:
+      id_suffix:
+        description: "App id suffix. '.fps' installs next to the original app; empty replaces it (needs the same signing key)"
+        default: ".fps"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      NDK_VER: "30.0.16248370"
+      CMAKE_VER: "3.30.4"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # A repository made from a zip has no submodule contents: libadrenotools (with its own submodules) is cloned then
+      - name: libadrenotools
+        run: |
+          if [ ! -f third_party/libadrenotools/CMakeLists.txt ]; then
+            rm -rf third_party/libadrenotools
+            git clone --recursive --depth 1 https://github.com/bylaws/libadrenotools third_party/libadrenotools
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK packages
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-36" "ndk;$NDK_VER" "cmake;$CMAKE_VER"
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            android/deps/out
+            android/deps/src
+          key: botw-deps-${{ hashFiles('android/deps/*.sh', 'android/deps/*.patch') }}
+
+      - name: SDL3, shaderc, headers, font
+        run: bash android/deps/build_deps.sh
+
+      - name: FFmpeg
+        run: |
+          [ -f android/deps/out/lib/libavcodec.so ] || \
+            ANDROID_NDK_LINUX="$ANDROID_HOME/ndk/$NDK_VER" bash android/deps/build_ffmpeg.sh
+
+      - name: Game code builder (Python, zig, unicorn, capstone)
+        run: bash android/deps/build_gen_deps.sh
+
+      - name: Build the APK
+        working-directory: android/botwrecompandroid
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon "-PbotwIdSuffix=${{ inputs.id_suffix }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BOTWRecompAndroid-apk
+          path: android/botwrecompandroid/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
