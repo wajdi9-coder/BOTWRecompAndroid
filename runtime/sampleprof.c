@@ -57,6 +57,8 @@ static volatile int s_on;
 static double s_len = 15;
 extern uint64_t plat_wt_faults(uint64_t *ahead_pages);  // (runtime/platform/android.c: page write-tracking faults so far)
 static uint64_t s_f0, s_a0, s_f1, s_a1;
+extern uint64_t kernel_wake_stats(uint64_t *idle);  // (runtime/kernel.c: the guest kernel's wake-ups of threads so far)
+static uint64_t s_w0, s_wi0, s_w1, s_wi1;
 
 typedef struct {
     int tid;
@@ -334,6 +336,8 @@ static void report(void) {
         total, s_len);
     LOG("[sampleprof] page write-tracking faults: %llu in %.0f s (%.0f a second); pages opened ahead: %llu\n",
         (unsigned long long)(s_f1 - s_f0), s_len, (double)(s_f1 - s_f0) / s_len, (unsigned long long)(s_a1 - s_a0));
+    LOG("[sampleprof] guest kernel wake-ups: %.0f a second, %.0f of them for a thread that was not asleep\n",
+        (double)(s_w1 - s_w0) / s_len, (double)(s_wi1 - s_wi0) / s_len);
     qsort(s_th, (size_t)s_nth, sizeof s_th[0], cmp_th);
     for (int i = 0; i < s_nth && i < 12; i++) {
         const Th *t = &s_th[i];
@@ -368,6 +372,7 @@ static void *sampler(void *arg) {
     struct timespec t0, now, nap = {0, 5 * 1000 * 1000};
     clock_gettime(CLOCK_MONOTONIC, &t0);
     s_f0 = plat_wt_faults(&s_a0);
+    s_w0 = kernel_wake_stats(&s_wi0);
     s_on = 1;
     LOG("[sampleprof] sampling for %.0f s\n", s_len);
     for (;;) {
@@ -394,6 +399,7 @@ static void *sampler(void *arg) {
         nanosleep(&nap, NULL);
     }
     s_f1 = plat_wt_faults(&s_a1);
+    s_w1 = kernel_wake_stats(&s_wi1);
     s_on = 0;
     usleep(60 * 1000);  // (signals still on their way)
     report();

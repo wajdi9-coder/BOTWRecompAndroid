@@ -1,4 +1,5 @@
 // A small Horizon kernel: handles, threads, synchronization, memory, and the SVC dispatcher.
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -26,6 +27,22 @@
 #define WAITERS_BIT 0x40000000u
 
 pthread_mutex_t g_klock = PTHREAD_MUTEX_INITIALIZER;
+
+// LARECOMP_KLOCK_SPIN=<n> (default 0: off): taking g_klock tries it n times (a few tens of ns each) before sleeping on it.
+// A thread woken by a signal sent under the lock needs the lock at once: without this it sleeps on it, and the unlock
+// that follows is another futex call to wake it (the game threads spent 20-35% of their running samples in futex calls:
+// LARECOMP_PROF_SAMPLE). The critical sections are a few list updates.
+static int k_spin = -1;
+static inline void klock_lock(void) {
+    if (__builtin_expect(k_spin < 0, 0)) k_spin = getenv("LARECOMP_KLOCK_SPIN") ? atoi(getenv("LARECOMP_KLOCK_SPIN")) : 0;
+    for (int i = 0; i < k_spin; i++) {
+        if (pthread_mutex_trylock(&g_klock) == 0) return;
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
+    pthread_mutex_lock(&g_klock);
+}
 static __thread KThread *t_cur;
 
 // ------------------------------------------------------------------ handle table
@@ -50,7 +67,7 @@ KObject *handle_get(uint32_t h) {
 }
 
 uint32_t kernel_new_handle(KObject *o) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     uint32_t h = handle_alloc(o);
     pthread_mutex_unlock(&g_klock);
     return h;
@@ -66,7 +83,24 @@ static void handle_close(uint32_t h) {
 // Threads blocked in WaitSynchronization; object signals wake only these (caller holds g_klock).
 static KThread *g_syncwaiters;
 
-static void wake(KThread *t) { pthread_cond_signal(&t->cond); }
+// LARECOMP_WAKE_GUARD=1 (default off): a thread that is not asleep on its condition (t->sleeping, kwait; set and cleared
+// under g_klock, which every waker holds) is not signalled: it looks at its wait state before it sleeps. A condition
+// signal is a futex call whether anyone sleeps there or not. (k_wakes: LARECOMP_PROF_SAMPLE's report)
+static _Atomic uint64_t k_wakes, k_wakes_idle;
+static int k_wake_guard = -1;
+uint64_t kernel_wake_stats(uint64_t *idle) {
+    if (idle) *idle = atomic_load_explicit(&k_wakes_idle, memory_order_relaxed);
+    return atomic_load_explicit(&k_wakes, memory_order_relaxed);
+}
+static void wake(KThread *t) {
+    if (__builtin_expect(k_wake_guard < 0, 0)) k_wake_guard = getenv("LARECOMP_WAKE_GUARD") != NULL;
+    atomic_fetch_add_explicit(&k_wakes, 1, memory_order_relaxed);
+    if (!t->sleeping) {
+        atomic_fetch_add_explicit(&k_wakes_idle, 1, memory_order_relaxed);
+        if (k_wake_guard) return;
+    }
+    pthread_cond_signal(&t->cond);
+}
 
 void kernel_signal(KObject *o) {
     // caller holds g_klock
@@ -100,11 +134,14 @@ static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
 __thread uint64_t g_blocked_ns;
 
 static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
-    pthread_cond_t *cv = t_cur ? &t_cur->cond : &g_nothread_cond;
+    KThread *self = t_cur;
+    pthread_cond_t *cv = self ? &self->cond : &g_nothread_cond;
     uint64_t t0 = plat_now_ns();
     bool r = true;
+    if (self) self->sleeping = true;  // (g_klock held: a waker sees it set from here until the wait returns)
     if (timeout_ns < 0) pthread_cond_wait(cv, &g_klock);
     else r = pthread_cond_timedwait(cv, &g_klock, ts) == 0;
+    if (self) self->sleeping = false;
     g_blocked_ns += plat_now_ns() - t0;
     return r;
 }
@@ -383,7 +420,7 @@ static void *thread_main(void *arg) {
 #else
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
 #endif
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     t->finished = true;
     kernel_signal(&t->obj);
     pthread_mutex_unlock(&g_klock);
@@ -408,7 +445,7 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     tls_next += 0x200;
     t->cpu.tpidrro = t->tlr;
     t->cpu.thread = t;
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     t->anext = g_threads;
     g_threads = t;
     pthread_mutex_unlock(&g_klock);
@@ -539,7 +576,7 @@ static uint32_t block_current(int64_t timeout_ns) {
                 if (__atomic_load_n(&t->wait_kind, __ATOMIC_ACQUIRE) != kind0 || g_rt_unwind) break;
                 __asm__ volatile("yield");
             }
-            pthread_mutex_lock(&g_klock);
+            klock_lock();
         }
     }
 #endif
@@ -575,7 +612,7 @@ static uint32_t block_current(int64_t timeout_ns) {
 }
 
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     uint32_t v = __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     if (v != (owner | WAITERS_BIT)) {
         pthread_mutex_unlock(&g_klock);
@@ -591,14 +628,14 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
 }
 
 static uint32_t svc_arbitrate_unlock(uint64_t addr) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     mutex_release(addr);
     pthread_mutex_unlock(&g_klock);
     return R_OK;
 }
 
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     KThread *t = t_cur;
 #ifdef __ANDROID__
     // the key says "waiters" before the mutex goes: once it's released, a thread that takes it, changes the state
@@ -628,7 +665,7 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
 }
 
 static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     int woken = 0;
     bool any_left = false;
     for (;;) {
@@ -660,7 +697,7 @@ enum { ARB_WAIT_LESS = 0, ARB_DEC_WAIT_LESS = 1, ARB_WAIT_EQ = 2 };
 enum { ARB_SIGNAL = 0, ARB_SIGNAL_INC_EQ = 1, ARB_SIGNAL_MOD_EQ = 2 };
 
 static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value, int64_t timeout) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     int32_t cur = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     bool wait;
     if (type == ARB_WAIT_LESS) wait = cur < value;
@@ -699,7 +736,7 @@ static int arbiter_wake(uint64_t addr, int32_t count) {
 }
 
 static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     uint32_t r = R_OK;
     int32_t cur = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     if (type == ARB_SIGNAL) {
@@ -740,7 +777,7 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
 // ------------------------------------------------------------------ wait synchronization
 
 static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, int64_t timeout, int32_t *index) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
     struct timespec ts;
     if (timeout > 0) deadline(&ts, timeout);
     KThread *t = t_cur;
@@ -1044,7 +1081,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         break;
     }
     case 0x0E: {  // GetThreadCoreMask(_, _, handle)
-        pthread_mutex_lock(&g_klock);
+        klock_lock();
         KObject *o = handle_get((uint32_t)x[2]);
         bool valid = o && o->type == KOBJ_THREAD;
         x[0] = valid ? R_OK : R_INVALID_HANDLE;
@@ -1054,7 +1091,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         break;
     }
     case 0x0F: {  // SetThreadCoreMask(handle, ideal_core, affinity_mask)
-        pthread_mutex_lock(&g_klock);
+        klock_lock();
         KObject *o = handle_get((uint32_t)x[0]);
         if (!o || o->type != KOBJ_THREAD) {
             pthread_mutex_unlock(&g_klock);
@@ -1075,7 +1112,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     }
     case 0x10: x[0] = __atomic_load_n(&t_cur->core, __ATOMIC_ACQUIRE); break;  // GetCurrentProcessorNumber
     case 0x11: case 0x12: case 0x17: {  // SignalEvent / ClearEvent / ResetSignal
-        pthread_mutex_lock(&g_klock);
+        klock_lock();
         KObject *o = handle_get((uint32_t)x[0]);
         if (!o) x[0] = R_INVALID_HANDLE;
         else {
@@ -1113,7 +1150,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         break;
     }
     case 0x16:  // CloseHandle
-        pthread_mutex_lock(&g_klock);
+        klock_lock();
         handle_close((uint32_t)x[0]);
         pthread_mutex_unlock(&g_klock);
         x[0] = R_OK;
@@ -1125,7 +1162,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         break;
     }
     case 0x19: {  // CancelSynchronization
-        pthread_mutex_lock(&g_klock);
+        klock_lock();
         KObject *o = handle_get((uint32_t)x[0]);
         if (o && o->type == KOBJ_THREAD) {
             ((KThread *)o)->cancel = true;
@@ -1258,7 +1295,7 @@ void kernel_stop_threads(void (*idle)(void)) {
     uint64_t t0 = plat_now_ns(), logged = t0;
     for (;;) {
         int live = 0;
-        pthread_mutex_lock(&g_klock);
+        klock_lock();
         for (KThread *t = g_threads; t; t = t->anext)
             if (t->started && !t->finished) { live++; wake(t); }
         pthread_cond_broadcast(&g_nothread_cond);
@@ -1291,7 +1328,7 @@ void kernel_stop_threads(void (*idle)(void)) {
 // Reboot, step 2 (threads stopped): a fresh kernel. Kernel objects are leaked rather than freed: host statics
 // can still point at some (vi.c's vsync event, signalled by its host timer thread).
 void kernel_reset(void) {
-    pthread_mutex_lock(&g_klock);
+    klock_lock();
 #ifdef __ANDROID__
     pthread_mutex_lock(&c0_m);
     c0_head = c0_tail = c0_holder = NULL;
