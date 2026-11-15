@@ -282,6 +282,18 @@ void plat_write_tracking_enable(uint64_t lo, uint64_t hi) {
 static uint64_t wt_odd, wt_odd_addr;
 static int wt_odd_repeats;
 
+// LARECOMP_WT_AHEAD=<n> (default 0: off): a fault on a page, when the page before it was written since it was asked
+// about (stores running along the memory), opens up to n pages after it in the same mprotect call - they count as
+// written, which only costs copying them again. Each fault is a signal, an mprotect and a sigreturn (~10 us on a phone)
+// and the game's buffers are written page after page: 16 MB a frame is 4000 faults. LARECOMP_WT_AHEAD_ALWAYS=1: not
+// only after a written neighbour. Read in plat_written_pages (the handler may not call getenv).
+static volatile int wt_ahead = -1, wt_ahead_always;
+static _Atomic uint64_t wt_faults, wt_ahead_pages;
+uint64_t plat_wt_faults(uint64_t *ahead_pages) {
+    if (ahead_pages) *ahead_pages = atomic_load_explicit(&wt_ahead_pages, memory_order_relaxed);
+    return atomic_load_explicit(&wt_faults, memory_order_relaxed);
+}
+
 // Each page made read-only or writable on its own splits the window's mapping: after half an hour the process ran into
 // Android's limit on mappings (~65000), mprotect failed, the page written to stayed read-only, and the same store
 // faulted until it was taken for a real fault - a crash in the game's code on a page marked written (Mali-G720, #196;
@@ -299,6 +311,7 @@ static bool wt_fault(uint64_t a) {
     if (!wt_state || a < wt_lo || a >= wt_hi) return false;
     uint64_t p = (a - wt_lo) >> 12, np = (wt_hi - wt_lo) >> 12;
     bool ours = false;
+    atomic_fetch_add_explicit(&wt_faults, 1, memory_order_relaxed);
     wt_lock();
     if (wt_state[p] == 1) wt_odd_repeats = 0;
     else if (wt_odd_addr == a && ++wt_odd_repeats > 8) { wt_unlock(); return false; }  // (a real fault)
@@ -323,6 +336,19 @@ static bool wt_fault(uint64_t a) {
             break;
         }
         ours = true;
+    }
+    if (ours && wt_ahead > 0 && !wt_broken) {  // (LARECOMP_WT_AHEAD, above: the run of read-only pages after p+1)
+        uint64_t q = p + 2;
+        if (q < np && wt_state[q] == 1 && (wt_ahead_always || (p > 0 && wt_state[p - 1] == 2))) {
+            uint64_t lim = q + (uint64_t)wt_ahead, e = q + 1;
+            if (lim > np) lim = np;
+            while (e < lim && wt_state[e] == 1) e++;
+            for (uint64_t k = q; k < e; k++) wt_state[k] = 2;
+            if (mprotect((void *)(uintptr_t)(wt_lo + (q << 12)), (e - q) << 12, PROT_READ | PROT_WRITE))
+                for (uint64_t k = q; k < e; k++) wt_state[k] = 1;  // (still read-only: they fault as before)
+            else
+                atomic_fetch_add_explicit(&wt_ahead_pages, e - q, memory_order_relaxed);
+        }
     }
     wt_unlock();
     return ours;
@@ -414,6 +440,13 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
                         (size_t)mi.uordblks >> 20, hbs, g_cmd_shadow_pages, g_cmd_host_chunks, vk);
             }
         }
+    }
+    if (wt_ahead < 0) {  // (LARECOMP_WT_AHEAD, at wt_fault)
+        const char *e = getenv("LARECOMP_WT_AHEAD");
+        int v = e ? atoi(e) : 0;
+        wt_ahead_always = getenv("LARECOMP_WT_AHEAD_ALWAYS") != NULL;
+        wt_ahead = v < 0 ? 0 : v > 256 ? 256 : v;
+        if (wt_ahead) fprintf(stderr, "[android] page write tracking: up to %d pages opened ahead%s\n", wt_ahead, wt_ahead_always ? " (always)" : "");
     }
     uint64_t p0 = (addr - wt_lo) >> 12, p1 = (addr + size - wt_lo + 0xFFF) >> 12;
     int n = 0;
