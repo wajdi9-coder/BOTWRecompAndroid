@@ -27,7 +27,15 @@
 // function, at -O0: HEAVY_LINES) took 6-8 GB on the POCO F7 Ultra for over 20 minutes, until Android ended the app
 // ("swap is low and thrashing", 2026-10-27) - on the PC's NDK clang with those flags, 23 GB and a failure; without
 // them 1.45 GB in 19 s. None of it belongs in the game code (UBSan also checks every operation at run time).
-#define GAMELIB_CFLAGS "-target aarch64-linux-musl -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -fPIC -mllvm -dag-maps-huge-region=500 -fno-sanitize=undefined -fno-stack-protector -g0"
+// GAMELIB_CPU (-D, the Gradle property botwGameCpu, android/gamelib_id.cmake): a CPU for zig's -mcpu, e.g. cortex_a715 -
+// the game code scheduled for that core, with its instructions (the atomics as LSE ones, not exclusive-load loops). Not
+// set (the default): the baseline, as before. It is in GAMELIB_ID, so an app built with one rebuilds the game code.
+#ifdef GAMELIB_CPU
+#define GAMELIB_CPU_FLAG " -mcpu=" GAMELIB_CPU
+#else
+#define GAMELIB_CPU_FLAG ""
+#endif
+#define GAMELIB_CFLAGS "-target aarch64-linux-musl -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -fPIC -mllvm -dag-maps-huge-region=500 -fno-sanitize=undefined -fno-stack-protector -g0" GAMELIB_CPU_FLAG
 #define GAMELIB_SHARED "-target aarch64-linux-musl -shared -nostdlib -Wl,-z,max-page-size=16384"
 #endif
 // From the Makefile: the flags the game code is compiled and linked with (as `make` builds it in a source checkout)
