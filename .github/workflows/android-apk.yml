@@ -84,6 +84,20 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon "-PbotwIdSuffix=${{ inputs.id_suffix }}" "-PbotwGameCpu=${{ inputs.game_cpu }}"
 
+      # The APK's libmain.so is stripped; this copy keeps the function names, to name the addresses the profiler
+      # (LARECOMP_PROF_SAMPLE, runtime/sampleprof.c) logs for this build
+      - name: libmain.so with its symbols
+        run: |
+          mkdir -p symbols
+          f=$(find android/botwrecompandroid/app/build/intermediates/cxx -name libmain.so -path '*arm64-v8a*' | head -n 1)
+          [ -n "$f" ] && cp -v "$f" symbols/libmain.so || echo "no unstripped libmain.so found"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmain-symbols
+          path: symbols/libmain.so
+          if-no-files-found: warn
+
       - uses: actions/upload-artifact@v4
         with:
           name: BOTWRecompAndroid-apk
