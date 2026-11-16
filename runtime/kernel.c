@@ -250,6 +250,32 @@ static int c0_on = -1;
 static KThread *c0_holder;  // (c0_m) the thread that has core 0, since c0_since
 static uint64_t c0_since;
 
+// LARECOMP_C0_DIRECT=1 (default off): a hand-over of core 0 wakes the next thread in the queue, not all that wait. Every
+// waiter slept on one condition variable and every release was a broadcast: each of the 5 or 10 threads woke, fought
+// for c0_m and, but one, went back to sleep - 1800 hand-overs a second (the log's "core 0, last 30 s: N takes"), each
+// at ~47 us of wait on average. Now each waits on its own condition (c0_cond, signalled only while it sleeps there), and
+// the thread next in line is woken as soon as core 0 is taken, while its holder still runs, and watches the holder
+// for up to LARECOMP_C0_SPIN_US (default 150) awake: the release finds it running, not asleep. The order (the
+// queue) and the exclusion (c0_holder, under c0_m) are as before.
+static int c0_direct;
+static uint64_t c0_spin_ns;
+static pthread_once_t c0_once = PTHREAD_ONCE_INIT;
+static void core0_init(void);
+static void c0_signal(KThread *t) {  // (c0_m held)
+    if (t && t->c0_sleeping) pthread_cond_signal(&t->c0_cond);
+}
+// c0_m held: core 0's owner or queue changed - wake what can go on (all, as before, unless LARECOMP_C0_DIRECT)
+static void c0_changed(void) {
+    pthread_once(&c0_once, core0_init);
+    if (!c0_direct) pthread_cond_broadcast(&c0_cv);
+    else if (!c0_holder) c0_signal(c0_head);
+}
+static void c0_wake_all(void) {  // (c0_m held)
+    pthread_once(&c0_once, core0_init);
+    if (!c0_direct) pthread_cond_broadcast(&c0_cv);
+    else for (KThread *t = c0_head; t; t = t->core0_next) c0_signal(t);
+}
+
 // Telemetry (c0_m; issue #41: how much of a frame goes to waiting for core 0, against a slow clock): every 30 s one log
 // line - how often core 0 changed hands, the waits for it (total, longest) and how much of the time it was held.
 static struct { uint64_t start, takes, waited, longest, held; } c0_stat;
@@ -294,9 +320,10 @@ static void *core0_slicer(void *arg) {
     return NULL;
 }
 
-static pthread_once_t c0_once = PTHREAD_ONCE_INIT;
 static void core0_init(void) {
     c0_on = !getenv("LARECOMP_NO_CORE0");
+    c0_direct = getenv("LARECOMP_C0_DIRECT") != NULL;
+    c0_spin_ns = (getenv("LARECOMP_C0_SPIN_US") ? (uint64_t)atol(getenv("LARECOMP_C0_SPIN_US")) : 150) * 1000;
     const char *e = getenv("LARECOMP_C0_SLICE_MS");
     if (e && atoi(e) > 0) c0_slice_ns = (uint64_t)atoi(e) * 1000000;
     if (c0_on && c0_slice_ns) {
@@ -315,14 +342,14 @@ static void core0_acquire(KThread *t) {
         if (t->core0_held) {
             t->core0_held = false;
             c0_held_until(plat_now_ns()), c0_holder = NULL;
-            pthread_cond_broadcast(&c0_cv);
+            c0_changed();
         }
     }
     if (__atomic_load_n(&t->core, __ATOMIC_ACQUIRE) != 0) {
         if (t->core0_held) {
             t->core0_held = false;
             c0_held_until(plat_now_ns()), c0_holder = NULL;
-            pthread_cond_broadcast(&c0_cv);
+            c0_changed();
         }
         pthread_mutex_unlock(&c0_m);
         return;
@@ -335,8 +362,27 @@ static void core0_acquire(KThread *t) {
     else c0_head = t;
     c0_tail = t;
     uint64_t t0 = plat_now_ns();
-    while ((c0_holder || c0_head != t) && __atomic_load_n(&t->core, __ATOMIC_ACQUIRE) == 0 && !g_rt_unwind)
-        pthread_cond_wait(&c0_cv, &c0_m);
+    bool spun = false;
+    while ((c0_holder || c0_head != t) && __atomic_load_n(&t->core, __ATOMIC_ACQUIRE) == 0 && !g_rt_unwind) {
+        if (!c0_direct) {
+            pthread_cond_wait(&c0_cv, &c0_m);
+            continue;
+        }
+        if (c0_spin_ns && !spun && c0_head == t) {  // next in line: watch the holder awake (LARECOMP_C0_DIRECT, above)
+            spun = true;
+            pthread_mutex_unlock(&c0_m);
+            for (uint64_t end = plat_now_ns() + c0_spin_ns; plat_now_ns() < end;) {
+                if (!__atomic_load_n(&c0_holder, __ATOMIC_ACQUIRE) || __atomic_load_n(&t->core, __ATOMIC_ACQUIRE) != 0 || g_rt_unwind) break;
+                __asm__ volatile("yield");
+            }
+            pthread_mutex_lock(&c0_m);
+            continue;
+        }
+        t->c0_sleeping = true;
+        pthread_cond_wait(&t->c0_cond, &c0_m);
+        t->c0_sleeping = false;
+        spun = false;
+    }
     uint64_t now = plat_now_ns(), w = now - t0;
     g_blocked_ns += w;
     c0_stat.takes++, c0_stat.waited += w;
@@ -348,13 +394,14 @@ static void core0_acquire(KThread *t) {
     if (c0_tail == t) c0_tail = prev;
     t->core0_next = NULL;
     if (__atomic_load_n(&t->core, __ATOMIC_ACQUIRE) != 0 || g_rt_unwind) {
-        pthread_cond_broadcast(&c0_cv);
+        c0_changed();
         pthread_mutex_unlock(&c0_m);
         return;
     }
     t->core0_held = true;
     c0_holder = t;
     c0_since = now;
+    if (c0_direct) c0_signal(c0_head);  // (the next in line wakes now, while this thread runs, and watches it)
     pthread_mutex_unlock(&c0_m);
 }
 
@@ -374,7 +421,7 @@ static void core0_release(KThread *t) {
     if (t->core0_held) {
         t->core0_held = false;
         if (c0_holder == t) c0_held_until(plat_now_ns()), c0_holder = NULL;
-        pthread_cond_broadcast(&c0_cv);
+        c0_changed();
     }
     pthread_mutex_unlock(&c0_m);
 }
@@ -431,6 +478,7 @@ static void *thread_main(void *arg) {
 static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int prio, int core) {
     KThread *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cond, NULL);
+    pthread_cond_init(&t->c0_cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
     t->prio = prio;
@@ -473,7 +521,8 @@ static uint32_t thread_set_core_mask(KThread *t, int ideal, uint64_t mask) {
             __atomic_store_n(&t->core0_evicted, true, __ATOMIC_RELEASE);
             if (c0_nevicted++ == 0) __atomic_fetch_or(&g_fnprof, 2, __ATOMIC_SEQ_CST);
         }
-        pthread_cond_broadcast(&c0_cv);
+        if (c0_direct) c0_signal(t);  // (t may sleep in the queue: it leaves, its core is not 0 now)
+        c0_changed();
         pthread_mutex_unlock(&c0_m);
 #endif
     }
@@ -1302,7 +1351,7 @@ void kernel_stop_threads(void (*idle)(void)) {
         pthread_mutex_unlock(&g_klock);
 #ifdef __ANDROID__
         pthread_mutex_lock(&c0_m);
-        pthread_cond_broadcast(&c0_cv);
+        c0_wake_all();
         pthread_mutex_unlock(&c0_m);
 #endif
         if (!live) break;

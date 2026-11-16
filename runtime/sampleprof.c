@@ -59,6 +59,25 @@ extern uint64_t plat_wt_faults(uint64_t *ahead_pages);  // (runtime/platform/and
 static uint64_t s_f0, s_a0, s_f1, s_a1;
 extern uint64_t kernel_wake_stats(uint64_t *idle);  // (runtime/kernel.c: the guest kernel's wake-ups of threads so far)
 static uint64_t s_w0, s_wi0, s_w1, s_wi1;
+// each core's clock (kHz), read from sysfs every ~100 ms while sampling: where the cores really run in the window
+#define NFREQ 16
+static uint64_t s_fsum[NFREQ], s_fmax[NFREQ];
+static uint32_t s_fn[NFREQ];
+static void read_freqs(void) {
+    for (int c = 0; c < NFREQ; c++) {
+        char p[96];
+        snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
+        FILE *f = fopen(p, "r");
+        if (!f) continue;
+        unsigned long khz = 0;
+        if (fscanf(f, "%lu", &khz) == 1) {
+            s_fsum[c] += khz;
+            s_fn[c]++;
+            if (khz > s_fmax[c]) s_fmax[c] = khz;
+        }
+        fclose(f);
+    }
+}
 
 typedef struct {
     int tid;
@@ -338,6 +357,15 @@ static void report(void) {
         (unsigned long long)(s_f1 - s_f0), s_len, (double)(s_f1 - s_f0) / s_len, (unsigned long long)(s_a1 - s_a0));
     LOG("[sampleprof] guest kernel wake-ups: %.0f a second, %.0f of them for a thread that was not asleep\n",
         (double)(s_w1 - s_w0) / s_len, (double)(s_wi1 - s_wi0) / s_len);
+    {
+        char line[200] = "";
+        size_t n = 0;
+        for (int c = 0; c < NFREQ; c++)
+            if (s_fn[c] && n + 28 < sizeof line)
+                n += (size_t)snprintf(line + n, sizeof line - n, " cpu%d %llu (max %llu)", c,
+                                      (unsigned long long)(s_fsum[c] / s_fn[c] / 1000), (unsigned long long)(s_fmax[c] / 1000));
+        LOG("[sampleprof] core clocks in the window, MHz, average (highest seen):%s\n", n ? line : " not readable");
+    }
     qsort(s_th, (size_t)s_nth, sizeof s_th[0], cmp_th);
     for (int i = 0; i < s_nth && i < 12; i++) {
         const Th *t = &s_th[i];
@@ -375,7 +403,8 @@ static void *sampler(void *arg) {
     s_w0 = kernel_wake_stats(&s_wi0);
     s_on = 1;
     LOG("[sampleprof] sampling for %.0f s\n", s_len);
-    for (;;) {
+    for (int round = 0;; round++) {
+        if (round % 20 == 0) read_freqs();
         clock_gettime(CLOCK_MONOTONIC, &now);
         if ((double)(now.tv_sec - t0.tv_sec) + (double)(now.tv_nsec - t0.tv_nsec) * 1e-9 >= s_len) break;
         DIR *d = opendir("/proc/self/task");
